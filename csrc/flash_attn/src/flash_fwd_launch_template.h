@@ -50,15 +50,15 @@ DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_splitkv_combine_kernel, int kBlockM, int L
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
 void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
-    constexpr size_t smem_size = Kernel_traits::kSmemSize;
+    constexpr size_t smem_size = Kernel_traits::kSmemSize; // 一个cuda block需要申请的smem size
     // printf("smem_size = %d\n", smem_size);
 
     // Work-around for gcc 7. It doesn't like nested BOOL_SWITCH.
     // https://github.com/kokkos/kokkos-kernels/issues/349
     // https://github.com/HazyResearch/flash-attention/issues/21
 
-    const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
-    dim3 grid(num_m_block, params.b, params.h);
+    const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM; // q 需要分几块, + 后面的是为了除的时候保证快数一定够用， kBlockM啥的都是外面写死128或者其他的，估计是实测根据不同的head size测出来的参数配置
+    dim3 grid(num_m_block, params.b, params.h); // 因为 flash atten2，q是外循环，而且可以cuda block并行了，因此dim3第一维度直接分配对应的cuda block个数，b是batch，h是head num
     const bool is_even_MN = params.cu_seqlens_q == nullptr && params.cu_seqlens_k == nullptr && params.seqlen_k % Kernel_traits::kBlockN == 0 && params.seqlen_q % Kernel_traits::kBlockM == 0;
     const bool is_even_K = params.d == Kernel_traits::kHeadDim;
     const bool return_softmax = params.p_ptr != nullptr;
@@ -76,7 +76,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                         // auto kernel = &flash_fwd_kernel<Kernel_traits, false, Is_causal, false, false, true, true, false>;
                         // printf("IsEvenMNConst = %d, IsEvenKConst = %d, Is_local = %d, Is_causal = %d, ReturnSoftmaxConst = %d, Is_dropout = %d\n", int(IsEvenMNConst), int(IsEvenKConst), int(Is_local), int(Is_causal), int(ReturnSoftmaxConst), int(Is_dropout));
                         // auto kernel = &flash_fwd_kernel<Kernel_traits, false, Is_causal, false, true, true, false>;
-                        if (smem_size >= 48 * 1024) {
+                        if (smem_size >= 48 * 1024) { // A30一个SM最多48k smem
                             C10_CUDA_CHECK(cudaFuncSetAttribute(
                                 kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
                         }
@@ -84,7 +84,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                         // cudaError status_ = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
                         //     &ctas_per_sm, kernel, Kernel_traits::kNThreads, smem_size);
                         // printf("smem_size = %d, CTAs per SM = %d\n", int(smem_size), ctas_per_sm);
-                        kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
+                        kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params); // 一个 block 需要 4 个 warp即 4 * 32个线程即kNThreads
                         C10_CUDA_KERNEL_LAUNCH_CHECK();
                     });
                 });

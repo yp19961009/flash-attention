@@ -69,7 +69,7 @@ struct Flash_fwd_kernel_traits : public Base {
     static_assert(kHeadDim % 32 == 0);
     static constexpr int kBlockKSmem = kHeadDim % 64 == 0 ? 64 : 32;
     static constexpr int kBlockKGmem = kHeadDim % 128 == 0 ? 128 : (kHeadDim % 64 == 0 ? 64 : 32);
-    static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
+    static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3; // why？？？
 
     using TiledMma = TiledMMA<
         typename Base::MMA_Atom_Arch,
@@ -77,12 +77,12 @@ struct Flash_fwd_kernel_traits : public Base {
         Tile<Int<16 * kNWarps>, _16, _16>>;
 
     using SmemLayoutAtomQ = decltype(
-        composition(Swizzle<kSwizzle, 3, 3>{},
+        composition(Swizzle<kSwizzle, 3, 3>{}, // swizzle是通过异或打乱逻辑存储对应的实际存储，从而避免bank conflict，Swizzle是对实际存储一维offset进行操作，通过Swizzle<kSwizzle, 3, 3>,这个2的kSwizzle个元素为基本单位，2的三次方行，2的三次方列，然后行和列进行xor，最终把发生bank conflict的情况的实际smem存储，在存到smem中时，打乱到不同bank，但是还保留着逻辑位置到真实位置的映射，因此load的时候也能正确找到该thread对应逻辑位置的真实值
                     // This has to be kBlockKSmem, using kHeadDim gives wrong results for d=128
-                    Layout<Shape<_8, Int<kBlockKSmem>>,
+                    Layout<Shape<_8, Int<kBlockKSmem>>, // smem aton是8行，kBlockKSmem列（32或者64）
                            Stride<Int<kBlockKSmem>, _1>>{}));
-    using SmemLayoutQ = decltype(tile_to_shape(
-        SmemLayoutAtomQ{},
+    using SmemLayoutQ = decltype(tile_to_shape( // kBlockM即一个q block分块，seqlen上的长度，kHeadDim即另一维的长度，decltype是根据返回值推导出来其类型，让其类型别名为SmemLayoutQ，相当于模版实例化的类型，属于模版元编程
+        SmemLayoutAtomQ{}, // 一个 SmemLayoutQ 可能需要多个SmemLayoutAtomQ，比如 SmemLayoutAtomQ 是32，SmemLayoutQ是160
         Shape<Int<kBlockM>, Int<kHeadDim>>{}));
 
     using SmemLayoutKV = decltype(tile_to_shape(
@@ -106,7 +106,7 @@ struct Flash_fwd_kernel_traits : public Base {
 
     static constexpr int kSmemQSize = size(SmemLayoutQ{}) * sizeof(Element);
     static constexpr int kSmemKVSize = size(SmemLayoutKV{}) * 2 * sizeof(Element);
-    static constexpr int kSmemSize = Share_Q_K_smem ? std::max(kSmemQSize, kSmemKVSize) : kSmemQSize + kSmemKVSize;
+    static constexpr int kSmemSize = Share_Q_K_smem ? std::max(kSmemQSize, kSmemKVSize) : kSmemQSize + kSmemKVSize; // 两种方案，假如qk不共享smem，一个cuda block就需要q block分块中需要smem和k
 
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
     static_assert(kHeadDim % kGmemElemsPerLoad == 0, "kHeadDim must be a multiple of kGmemElemsPerLoad");

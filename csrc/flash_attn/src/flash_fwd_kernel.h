@@ -32,10 +32,10 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     using index_t = typename Kernel_traits::index_t;
 
     // Shared memory.
-    extern __shared__ char smem_[];
+    extern __shared__ char smem_[]; // extern表示从外面传入，动态的
 
     // The thread index.
-    const int tidx = threadIdx.x;
+    const int tidx = threadIdx.x; // 一个cuda block中的thread id
 
     constexpr int kBlockM = Kernel_traits::kBlockM;
     constexpr int kBlockN = Kernel_traits::kBlockN;
@@ -112,12 +112,13 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     const index_t row_offset_p = ((bidb * params.h + bidh) * params.seqlen_q_rounded
         + m_block * kBlockM) * params.seqlen_k_rounded + (n_block_max - 1) * kBlockN;
-
+    // 通过 cuda cute进行矩阵乘法
+    // make tensor只是一种view，并没有实质性的copy
     Tensor mQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.q_ptr)
-                                          + binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)),
-                            make_shape(binfo.actual_seqlen_q, params.h, params.d),
+                                          + binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)), // 后面的 + 是为了定位到不同batch的index，这里确定了是哪个batch
+                            make_shape(binfo.actual_seqlen_q, params.h, params.d), // 这里的make shape make stride是cuda cute中对逻辑存储和实际存储中中的一种映射表示，即所谓layerout，是逻辑位置，到一维物理offset的映射
                             make_stride(params.q_row_stride, params.q_head_stride, _1{}));
-    Tensor gQ = local_tile(mQ(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
+    Tensor gQ = local_tile(mQ(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{}, // 从mQ中切块，但只是view，没有实际的copy啥的，这里把head确定，在通过mblock定位到一个cuda block负责的(kBlockM, kHeadDim)
                            make_coord(m_block, 0));  // (kBlockM, kHeadDim)
     Tensor mK = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.k_ptr)
                                           + binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb)),
@@ -131,11 +132,11 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                             make_stride(params.v_row_stride, params.v_head_stride, _1{}));
     Tensor gV = local_tile(mV(_, bidh / params.h_h_k_ratio, _), Shape<Int<kBlockN>, Int<kHeadDim>>{},
                            make_coord(_, 0));  // (kBlockN, kHeadDim, nblocksN)
-    Tensor gP = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.p_ptr) + row_offset_p),
+    Tensor gP = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.p_ptr) + row_offset_p), // 输出的 softmax(qk)
                             Shape<Int<kBlockM>, Int<kBlockN>>{},
                             make_stride(params.seqlen_k_rounded, _1{}));
 
-    Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
+    Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)), // q的smem
                             typename Kernel_traits::SmemLayoutQ{});
     // Careful we're using the same smem for sQ and sK | sV if Share_Q_K_smem;
     Tensor sK = make_tensor(sQ.data() + (Kernel_traits::Share_Q_K_smem ? 0 : size(sQ)),
@@ -191,7 +192,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // Tensor tKVpKV = make_tensor<bool>(make_shape(size<1>(tKsK), size<2>(tKsK)), Stride<_1,_0>{});
 
     // Construct identity layout for sQ and sK
-    Tensor cQ = make_identity_tensor(make_shape(size<0>(sQ), size<1>(sQ)));    // (BLK_M,BLK_K) -> (blk_m,blk_k)
+    Tensor cQ = make_identity_tensor(make_shape(size<0>(sQ), size<1>(sQ)));    // (BLK_M,BLK_K) -> (blk_m,blk_k)  // 作用是什么？
     Tensor cKV = make_identity_tensor(make_shape(size<0>(sK), size<1>(sK)));    // (BLK_N,BLK_K) -> (blk_n,blk_k)
     // Tensor tScQ = thr_mma.partition_A(cQ);                           // (MMA,MMA_M,MMA_K)
     // if (cute::thread0()) {
@@ -223,7 +224,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     }
 
     // Prologue
-
+    // global mem -> smem，会做swizzle（tQsQ里）
     // We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
     flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ,
                                        binfo.actual_seqlen_q - m_block * kBlockM);
@@ -242,8 +243,9 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         __syncthreads();
     }
 
-    int n_block = n_block_max - 1;
+    int n_block = n_block_max - 1; // 来决定k这边循环的次数
     // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
+    // global mem -> smem mem of k 
     flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK, tKVcKV, tKVpKV,
                                        binfo.actual_seqlen_k - n_block * kBlockN);
     cute::cp_async_fence();
@@ -273,10 +275,10 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     // If not even_N, then seqlen_k might end in the middle of a block. In that case we need to
     // mask 2 blocks (e.g. when kBlockM == kBlockN), not just 1.
-    constexpr int n_masking_steps = (!Is_causal && !Is_local)
+    constexpr int n_masking_steps = (!Is_causal && !Is_local) 
         ? 1
         : ((Is_even_MN && Is_causal) ? cute::ceil_div(kBlockM, kBlockN) : cute::ceil_div(kBlockM, kBlockN) + 1);
-    #pragma unroll
+    #pragma unroll // 循环展开，编译期间就把循环条件算好，有利于加速，如果is causal 是 true的话，就会 执行下面的mask的计算，否则略过
     for (int masking_step = 0; masking_step < n_masking_steps; ++masking_step, --n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
         clear(acc_s);
@@ -293,13 +295,13 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             );
         }
         cute::cp_async_fence();
-
+        // 那寄存器中的值，进行计算（里面有smem load到register）
         flash::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
             smem_thr_copy_Q, smem_thr_copy_K
         );
         // if (cute::thread0()) { print(acc_s); }
-
+        // 对 qk的结果进行mask
         mask.template apply_mask<Is_causal, Is_even_MN>(
             acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
         );
@@ -313,7 +315,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             cute::cp_async_fence();
         }
 
-        // TODO: when we have key_padding_mask we'll need to Check_inf
+        // TODO: when we have key_padding_mask we'll need to Check_inf，计算softmax，需要先将数据类型转为fp32，同时减去max
         masking_step == 0
             ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2)
             : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2);
@@ -339,12 +341,13 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
         Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
         // if (cute::thread0()) { print(tOrP); }
+        // 计算v，acc_o每次循环都会更新这个，循环结束后，就计算出来了这个q block对 一整行 kv的结果
         flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
         // if (cute::thread0()) { print(scores); }
 
         // This check is at the end of the loop since we always have at least 1 iteration
         if (n_masking_steps > 1 && n_block <= n_block_min) {
-            --n_block;
+            --n_block; // 这里执行的话，最后导致下面的循环就不需要执行了
             break;
         }
     }
@@ -400,7 +403,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
     }
 
-    // Epilogue
+    // Epilogue 后处理
 
     Tensor lse = softmax.template normalize_softmax_lse<Is_dropout>(acc_o, params.scale_softmax, params.rp_dropout);
 
@@ -416,7 +419,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // sO has the same size as sQ, so we don't need to sync here.
     if (Kernel_traits::Share_Q_K_smem) { __syncthreads(); }
 
-    cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
+    cute::copy(smem_tiled_copy_O, taccOrO, taccOsO); // o reg -> smem
 
     Tensor mO = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.o_ptr)
                                           + binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)),
@@ -979,7 +982,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     // sOaccum is larger than sQ, so we need to syncthreads here
     // TODO: allocate enough smem for sOaccum
     if constexpr (Split) { __syncthreads(); }
-
+    // o  register->smem  taccOsOaccum 就是 sOaccum
     cute::copy(smem_tiled_copy_Oaccum, taccOrOaccum, taccOsOaccum);
 
     const index_t row_offset_o = binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)
@@ -1029,6 +1032,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(0, 0, k)) < params.d; }
     }
     // Clear_OOB_K must be false since we don't want to write zeros to gmem
+    // 为啥不直接从 register copy到 global mem？拷贝来拷贝去？
     flash::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
         gmem_tiled_copy_Oaccum, tOrOaccum, tOgOaccum, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
     );
@@ -1038,9 +1042,9 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Return_softmax, typename Params>
 inline __device__ void compute_attn(const Params &params) {
-    const int m_block = blockIdx.x;
+    const int m_block = blockIdx.x;  // q的block 并行，一个m_block 负责 一个 q block
     // The block index for the batch.
-    const int bidb = blockIdx.y;
+    const int bidb = blockIdx.y; 
     // The block index for the head.
     const int bidh = blockIdx.z;
 
